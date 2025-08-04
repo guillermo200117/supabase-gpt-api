@@ -1,1 +1,0 @@
-# supabase-gpt-api
