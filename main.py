@@ -70,4 +70,4 @@ async def consultar_datos(request: Request):
         cur.close()
         conn.close()
 
-        return {"sql": sql_query, "resultados": resultad_
+        return {"sql": sql_query, "resultados": resultados}
