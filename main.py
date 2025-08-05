@@ -1,10 +1,13 @@
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-import psycopg2
 import os
+import openai
+import psycopg2
 
+# Inicializar FastAPI
 app = FastAPI()
 
+# Permitir solicitudes desde cualquier origen
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -13,64 +16,85 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Conexión a la base de datos Supabase
+SUPABASE_CONFIG = {
+    "host": "db.pxeltnnjywvtihbrlanr.supabase.co",
+    "database": "postgres",
+    "user": "postgres",
+    "password": os.getenv("SUPABASE_PASSWORD"),
+    "port": "5432"
+}
+
+# Configurar clave de OpenAI
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
 @app.get("/")
-def home():
+def health_check():
     return {"status": "API funcionando correctamente"}
 
-@app.get("/ventas")
-def obtener_ventas(
-    zona: str = Query(None),
-    ruta: str = Query(None),
-    representante: str = Query(None),
-    ano: str = Query(None),
-    mes: str = Query(None),
-):
-    conn = psycopg2.connect(
-        host="db.pxeltnnjywvtihbrlanr.supabase.co",
-        database="postgres",
-        user="postgres",
-        password=os.getenv("SUPABASE_PASSWORD"),
-        port="5432"
-    )
-    cur = conn.cursor()
+@app.post("/query")
+async def consultar_datos(request: Request):
+    data = await request.json()
+    pregunta = data.get("consulta", "")
 
-    query = """
-    SELECT 
-        ano, mes, zona, ruta, representante, producto,
-        SUM(presupuesto_unidades) AS presupuesto_unidades,
-        SUM(presupuesto_valores) AS presupuesto_valores,
-        SUM(ventas_unidades) AS ventas_unidades,
-        SUM(ventas_valores) AS ventas_valores,
-        ROUND(AVG(cumplimiento_unidades), 2) AS cumplimiento_unidades,
-        ROUND(AVG(cumplimiento_valores), 2) AS cumplimiento_valores
-    FROM "informe_eticos_x_linea"
-    WHERE 1=1
+    # Instrucción para que GPT actúe como generador de SQL
+    prompt = f"""
+    Eres un experto en bases de datos PostgreSQL.
+    Tu tarea es convertir preguntas en lenguaje natural en consultas SQL para la siguiente tabla:
+
+    Tabla: informe_eticos_x_linea
+    Columnas:
+    - fecha_reporte
+    - linea
+    - equipo
+    - zona
+    - representante
+    - ruta
+    - producto
+    - presupuesto_unidades
+    - presupuesto_valores
+    - ventas_unidades
+    - ventas_valores
+    - cumplimiento_unidades
+    - cumplimiento_valores
+
+    Solo genera la consulta SQL, sin explicaciones.
+
+    Pregunta: {pregunta}
+    SQL:
     """
 
-    if zona:
-        query += f" AND zona = '{zona}'"
-    if ruta:
-        query += f" AND ruta = '{ruta}'"
-    if representante:
-        query += f" AND representante = '{representante}'"
-    if ano:
-        query += f" AND ano = '{ano}'"
-    if mes:
-        query += f" AND mes = '{mes}'"
+    # Obtener la consulta SQL generada por GPT
+    try:
+        respuesta = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "Eres un asistente que convierte lenguaje natural en SQL."},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        sql_generado = respuesta.choices[0].message.content.strip().strip("`")
+    except Exception as e:
+        return {"error": "Error al generar SQL con OpenAI", "detalle": str(e)}
 
-    query += " GROUP BY ano, mes, zona, ruta, representante, producto"
+    # Conectar a Supabase y ejecutar la consulta
+    try:
+        conn = psycopg2.connect(**SUPABASE_CONFIG)
+        cur = conn.cursor()
+        cur.execute(sql_generado)
+        rows = cur.fetchall()
+        colnames = [desc[0] for desc in cur.description]
+        resultados = [dict(zip(colnames, row)) for row in rows]
+        cur.close()
+        conn.close()
+    except Exception as e:
+        return {
+            "sql": sql_generado,
+            "error": "Error al ejecutar consulta SQL",
+            "detalle": str(e)
+        }
 
-    cur.execute(query)
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-
-    columnas = [
-        "ano", "mes", "zona", "ruta", "representante", "producto",
-        "presupuesto_unidades", "presupuesto_valores",
-        "ventas_unidades", "ventas_valores",
-        "cumplimiento_unidades", "cumplimiento_valores"
-    ]
-
-    resultados = [dict(zip(columnas, fila)) for fila in rows]
-    return resultados
+    return {
+        "sql": sql_generado,
+        "resultados": resultados
+    }
