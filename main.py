@@ -1,12 +1,12 @@
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+import os
 import openai
 import psycopg2
-import os
 
 app = FastAPI()
 
-# Configurar CORS
+# Configurar CORS para permitir el acceso desde el frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -15,46 +15,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configurar API Key de OpenAI
-openai.api_key = os.getenv("OPENAI_API_KEY")
-
-# Ruta de prueba
+# Ruta principal para verificar si la API está funcionando
 @app.get("/")
-def home():
+def health_check():
     return {"status": "API funcionando correctamente"}
 
-# Ruta para consultas en lenguaje natural
+# Ruta para recibir preguntas en lenguaje natural y consultar Supabase
 @app.post("/query")
 async def consultar_datos(request: Request):
-    data = await request.json()
-    pregunta = data.get("consulta", "")
-
-    if not pregunta:
-        return {"error": "No se recibió una consulta válida"}
-
-    # Pedir a OpenAI que genere una consulta SQL a partir de lenguaje natural
-    prompt = f"""
-    Eres un asistente experto en SQL. Genera una consulta SQL para PostgreSQL basada en esta pregunta:
-    '{pregunta}'
-    La tabla se llama "informe_eticos_x_linea" y tiene las siguientes columnas:
-    fecha_reporte, linea, equipo, zona, representante, ruta, producto,
-    presupuesto_unidades, presupuesto_valores,
-    ventas_unidades, ventas_valores,
-    cumplimiento_unidades, cumplimiento_valores.
-    
-    Devuelve solo la consulta SQL. No expliques nada.
-    """
-
     try:
-        respuesta_ai = openai.ChatCompletion.create(
-            model="gpt-4",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0
-        )
+        data = await request.json()
+        pregunta = data.get("consulta", "")
 
-        sql_query = respuesta_ai.choices[0].message.content.strip()
-
-        # Conectar a Supabase (PostgreSQL)
+        # Conectar a la base de datos Supabase
         conn = psycopg2.connect(
             host=os.getenv("SUPABASE_HOST"),
             database=os.getenv("SUPABASE_DB"),
@@ -63,11 +36,36 @@ async def consultar_datos(request: Request):
             port="5432"
         )
         cur = conn.cursor()
+
+        # Enviar la pregunta al modelo de OpenAI
+        prompt = f"""
+Eres un experto en análisis de datos. Tengo una base de datos con la siguiente estructura:
+
+(fecha_reporte, línea, equipo, zona, representante, ruta, producto, presupuesto_unidades, presupuesto_valores, ventas_unidades, ventas_valores, cumplimiento_unidades, cumplimiento_valores)
+
+Con base en esto, genera una consulta SQL que responda a lo siguiente:
+{pregunta}
+"""
+
+        respuesta = openai.ChatCompletion.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "Eres un asistente que genera consultas SQL para bases de datos PostgreSQL."},
+                {"role": "user", "content": prompt}
+            ]
+        )
+
+        sql_query = respuesta['choices'][0]['message']['content'].strip().strip("```sql").strip("```")
+
         cur.execute(sql_query)
-        filas = cur.fetchall()
+        rows = cur.fetchall()
         columnas = [desc[0] for desc in cur.description]
-        resultados = [dict(zip(columnas, fila)) for fila in filas]
+        resultados = [dict(zip(columnas, fila)) for fila in rows]
+
         cur.close()
         conn.close()
 
         return {"sql": sql_query, "resultados": resultados}
+
+    except Exception as e:
+        return {"error": str(e)}
